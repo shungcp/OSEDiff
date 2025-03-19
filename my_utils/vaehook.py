@@ -61,7 +61,7 @@ import gc
 from time import time
 import math
 from tqdm import tqdm
-
+import time
 import torch
 import torch.version
 import torch.nn.functional as F
@@ -490,21 +490,28 @@ class GroupNormParam:
         summarize the mean and var and return a function
         that apply group norm on each tile
         """
+        s0 = time.time()
         if len(self.var_list) == 0:
             return None
         var = torch.vstack(self.var_list)
         mean = torch.vstack(self.mean_list)
         max_value = max(self.pixel_list)
         pixels = torch.tensor(
-            self.pixel_list, dtype=torch.float32, device=devices.device) / max_value
+            self.pixel_list, dtype=torch.float32, device='xla:0') / max_value
         sum_pixels = torch.sum(pixels)
         pixels = pixels.unsqueeze(
             1) / sum_pixels
         var = torch.sum(
             var * pixels, dim=0)
+        var = var.to(torch.bfloat16)
         mean = torch.sum(
             mean * pixels, dim=0)
-        return lambda x:  custom_group_norm(x, 32, mean, var, self.weight, self.bias)
+        mean = mean.to(torch.bfloat16)
+        self.weight = self.weight.to('xla:0')
+        self.bias = self.bias.to('xla:0')
+        #print(f"mean: {mean}, var: {var}, self.weight: {self.weight}, self.bias: {self.bias}")
+        #print(f"summary time is: {time.time() - s0}")
+        return lambda x:  custom_group_norm(x.to('xla:0'), 32, mean, var, self.weight, self.bias)
 
     @staticmethod
     def from_tile(tile, norm):
@@ -534,24 +541,28 @@ class GroupNormParam:
 
 
 class VAEHook:
-    def __init__(self, net, tile_size, is_decoder, fast_decoder, fast_encoder, color_fix, to_gpu=False):
+    def __init__(self, net, tile_size, is_decoder, fast_decoder, fast_encoder, color_fix, to_gpu=True):
         self.net = net                  # encoder | decoder
         self.tile_size = tile_size
         self.is_decoder = is_decoder
         self.fast_mode = (fast_encoder and not is_decoder) or (
             fast_decoder and is_decoder)
+        #print(f'VAEHook : fast_mode={self.fast_mode}')
         self.color_fix = color_fix and not is_decoder
         self.to_gpu = to_gpu
         self.pad = 11 if is_decoder else 32
 
     def __call__(self, x):
         B, C, H, W = x.shape
+        device = "xla:0"
         original_device = next(self.net.parameters()).device
+        print(f"original_device : {original_device}")
         try:
             if self.to_gpu:
                 self.net.to(devices.get_optimal_device())
             if max(H, W) <= self.pad * 2 + self.tile_size:
                 print("[Tiled VAE]: the input size is tiny and unnecessary to tile.")
+                self.net.to('xla:0')
                 return self.net.original_forward(x)
             else:
                 return self.vae_tile_forward(x)
@@ -634,6 +645,7 @@ class VAEHook:
 
     @torch.no_grad()
     def estimate_group_norm(self, z, task_queue, color_fix):
+        device = 'xla:0'
         device = z.device
         tile = z
         last_id = len(task_queue) - 1
@@ -683,6 +695,9 @@ class VAEHook:
         @param z: latent vector
         @return: image
         """
+        import time
+        device = 'xla:0'
+        time0 = time.time()
         device = next(self.net.parameters()).device
         net = self.net
         tile_size = self.tile_size
@@ -692,7 +707,8 @@ class VAEHook:
 
         N, height, width = z.shape[0], z.shape[2], z.shape[3]
         net.last_z_shape = z.shape
-
+        net.to('xla:0')
+        net.to(dtype = torch.bfloat16)
         # Split the input into tiles and build a task queue for each tile
         print(f'[Tiled VAE]: input_size: {z.shape}, tile_size: {tile_size}, padding: {self.pad}')
 
@@ -701,7 +717,7 @@ class VAEHook:
         # Prepare tiles by split the input latents
         tiles = []
         for input_bbox in in_bboxes:
-            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]].cpu()
+            tile = z[:, :, input_bbox[2]:input_bbox[3], input_bbox[0]:input_bbox[1]]
             tiles.append(tile)
 
         num_tiles = len(tiles)
@@ -714,7 +730,7 @@ class VAEHook:
             # Fast mode: downsample the input image to the tile size,
             # then estimate the group norm parameters on the downsampled image
             scale_factor = tile_size / max(height, width)
-            z = z.to(device)
+            z = z.to('xla:0')
             downsampled_z = F.interpolate(z, scale_factor=scale_factor, mode='nearest-exact')
             # use nearest-exact to keep statictics as close as possible
             print(f'[Tiled VAE]: Fast mode enabled, estimating group norm parameters on {downsampled_z.shape[3]} x {downsampled_z.shape[2]} image')
@@ -732,8 +748,9 @@ class VAEHook:
             if self.estimate_group_norm(downsampled_z, estimate_task_queue, color_fix=self.color_fix):
                 single_task_queue = estimate_task_queue
             del downsampled_z
-
+        time1 = time.time()
         task_queues = [clone_task_queue(single_task_queue) for _ in range(num_tiles)]
+        #print(f"num_tiles is {num_tiles}, len(task_queues[0] is {len(task_queues[0])}, and {task_queues[0]})")
 
         # Dummy result
         result = None
@@ -753,42 +770,44 @@ class VAEHook:
         forward = True
         interrupted = False
         #state.interrupted = interrupted
+        time11 = time.time()
         while True:
             #if state.interrupted: interrupted = True ; break
-
+            time_11 = time.time()
             group_norm_param = GroupNormParam()
             for i in range(num_tiles) if forward else reversed(range(num_tiles)):
                 #if state.interrupted: interrupted = True ; break
-
-                tile = tiles[i].to(device)
+                tile = tiles[i].to('xla:0')
                 input_bbox = in_bboxes[i]
                 task_queue = task_queues[i]
 
                 interrupted = False
                 while len(task_queue) > 0:
                     #if state.interrupted: interrupted = True ; break
-
+                    time_1 = time.time()
                     # DEBUG: current task
                     # print('Running task: ', task_queue[0][0], ' on tile ', i, '/', num_tiles, ' with shape ', tile.shape)
                     task = task_queue.pop(0)
+                    #print(task[0])
                     if task[0] == 'pre_norm':
                         group_norm_param.add_tile(tile, task[1])
                         break
                     elif task[0] == 'store_res' or task[0] == 'store_res_cpu':
                         task_id = 0
                         res = task[1](tile)
-                        if not self.fast_mode or task[0] == 'store_res_cpu':
-                            res = res.cpu()
+                        #if not self.fast_mode or task[0] == 'store_res_cpu':
+                        #    res = res.to(device)
                         while task_queue[task_id][0] != 'add_res':
                             task_id += 1
                         task_queue[task_id][1] = res
                     elif task[0] == 'add_res':
-                        tile += task[1].to(device)
+                        #tile += task[1].to(device)
+                        tile += task[1]
                         task[1] = None
                     else:
                         tile = task[1](tile)
                     pbar.update(1)
-
+                    #print(f"task_queue time is: {time.time() - time_1}")
                 if interrupted: break
 
                 # check for NaNs in the tile.
@@ -800,7 +819,7 @@ class VAEHook:
                     tiles[i] = None
                     num_completed += 1
                     if result is None:      # NOTE: dim C varies from different cases, can only be inited dynamically
-                        result = torch.zeros((N, tile.shape[1], height * 8 if is_decoder else height // 8, width * 8 if is_decoder else width // 8), device=device, requires_grad=False)
+                        result = torch.zeros((N, tile.shape[1], height * 8 if is_decoder else height // 8, width * 8 if is_decoder else width // 8), device='xla:0', requires_grad=False)
                     result[:, :, out_bboxes[i][2]:out_bboxes[i][3], out_bboxes[i][0]:out_bboxes[i][1]] = crop_valid_region(tile, in_bboxes[i], out_bboxes[i], is_decoder)
                     del tile
                 elif i == num_tiles - 1 and forward:
@@ -810,9 +829,10 @@ class VAEHook:
                     forward = True
                     tiles[i] = tile
                 else:
-                    tiles[i] = tile.cpu()
+                    tiles[i] = tile.to('xla:0')
                     del tile
-
+            time4 = time.time()
+            #print(f"vae num tile time is: {time4 - time_11}")
             if interrupted: break
             if num_completed == num_tiles: break
 
@@ -822,7 +842,10 @@ class VAEHook:
                 for i in range(num_tiles):
                     task_queue = task_queues[i]
                     task_queue.insert(0, ('apply_norm', group_norm_func))
-
+            time5 = time.time()
+            #print(f"end time is: {time5 - time4}")
+        print(f"while True time is: {time.time() - time11}")
         # Done!
         pbar.close()
-        return result if result is not None else result_approx.to(device)
+        print(f"vae file forward time is: {time.time() - time0}")
+        return result if result is not None else result_approx.to('xla:0')

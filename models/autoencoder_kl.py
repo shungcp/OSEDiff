@@ -18,6 +18,7 @@ import torch.nn as nn
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalVAEMixin
+#from diffusers.loaders.single_file_model import FromOriginalModelMixin as FromOriginalVAEMixin
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from diffusers.models.attention_processor import (
     ADDED_KV_ATTENTION_PROCESSORS,

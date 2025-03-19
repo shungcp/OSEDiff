@@ -11,7 +11,7 @@ from diffusers import DDPMScheduler
 from models.autoencoder_kl import AutoencoderKL
 from models.unet_2d_condition import UNet2DConditionModel
 from peft import LoraConfig
-
+from torch_xla.core import xla_model as xm
 from my_utils.vaehook import VAEHook, perfcount
 
 def initialize_vae(args):
@@ -70,12 +70,14 @@ def initialize_unet(args, return_lora_module_names=False, pretrained_model_name_
 class OSEDiff_gen(torch.nn.Module):
     def __init__(self, args):
         super().__init__()
+        #self.device = device
+        self.device =xm.xla_device()
 
         self.tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder").cuda()
+        self.text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder").to(self.device)
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-        self.noise_scheduler.set_timesteps(1, device="cuda")
-        self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.cuda()
+        self.noise_scheduler.set_timesteps(1, device=self.device)
+        self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(self.device)
         self.args = args
 
         self.vae, self.lora_vae_modules_encoder = initialize_vae(self.args)
@@ -83,9 +85,9 @@ class OSEDiff_gen(torch.nn.Module):
         self.lora_rank_unet = self.args.lora_rank
         self.lora_rank_vae = self.args.lora_rank
 
-        self.unet.to("cuda")
-        self.vae.to("cuda")
-        self.timesteps = torch.tensor([999], device="cuda").long()
+        self.unet.to(self.device)
+        self.vae.to(self.device)
+        self.timesteps = torch.tensor([999], device=self.device).long()
         self.text_encoder.requires_grad_(False)
 
     def set_train(self):
@@ -122,7 +124,7 @@ class OSEDiff_gen(torch.nn.Module):
         prompt_embeds = self.encode_prompt(batch["prompt"])
         neg_prompt_embeds = self.encode_prompt(batch["neg_prompt"])
 
-        model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=prompt_embeds.to(torch.float32),).sample
+        model_pred = self.unet(encoded_control, self.timesteps, encoder_hidden_states=prompt_embeds.to(torch.bfloat16),).sample
         x_denoised = self.noise_scheduler.step(model_pred, self.timesteps, encoded_control, return_dict=True).prev_sample
         output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
 
@@ -148,7 +150,7 @@ class OSEDiff_reg(torch.nn.Module):
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
         self.args = args
 
-        weight_dtype = torch.float32
+        weight_dtype = torch.bfloat16
         if accelerator.mixed_precision == "fp16":
             weight_dtype = torch.float16
         elif accelerator.mixed_precision == "bf16":
@@ -231,7 +233,7 @@ class OSEDiff_reg(torch.nn.Module):
 
             noise_pred_uncond, noise_pred_text = noise_pred_fix.chunk(2)
             noise_pred_fix = noise_pred_uncond + args.cfg_vsd * (noise_pred_text - noise_pred_uncond)
-            noise_pred_fix.to(dtype=torch.float32)
+            noise_pred_fix.to(dtype=torch.bfloat16)
 
             x0_pred_fix = self.eps_to_mu(self.noise_scheduler, noise_pred_fix, noisy_latents, timesteps)
 
@@ -247,22 +249,22 @@ class OSEDiff_test(torch.nn.Module):
         super().__init__()
 
         self.args = args
-        self.device =  torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device =xm.xla_device()
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="text_encoder")
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-        self.noise_scheduler.set_timesteps(1, device="cuda")
+        self.noise_scheduler.set_timesteps(1, device=self.device)
         self.vae = AutoencoderKL.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="vae")
         self.unet = UNet2DConditionModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="unet")
 
         # vae tile
         self._init_tiled_vae(encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
 
-        self.weight_dtype = torch.float32
+        self.weight_dtype = torch.bfloat16
         if args.mixed_precision == "fp16":
-            self.weight_dtype = torch.float16
+            self.weight_dtype = torch.bfloat16
 
-        osediff = torch.load(args.osediff_path)
+        osediff = torch.load(args.osediff_path, map_location=torch.device('cpu'))
         self.load_ckpt(osediff)
 
         # merge lora
@@ -271,11 +273,11 @@ class OSEDiff_test(torch.nn.Module):
             self.vae = self.vae.merge_and_unload()
             self.unet = self.unet.merge_and_unload()
 
-        self.unet.to("cuda", dtype=self.weight_dtype)
-        self.vae.to("cuda", dtype=self.weight_dtype)
-        self.text_encoder.to("cuda", dtype=self.weight_dtype)
-        self.timesteps = torch.tensor([999], device="cuda").long() 
-        self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.cuda()
+        self.unet.to(self.device, dtype=self.weight_dtype)
+        self.vae.to(self.device, dtype=self.weight_dtype)
+        self.text_encoder.to(self.device, dtype=self.weight_dtype)
+        self.timesteps = torch.tensor([999], device=self.device).long() 
+        self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(self.device)
 
         
 
@@ -452,17 +454,17 @@ class OSEDiff_inference_time(torch.nn.Module):
         super().__init__()
 
         self.args = args
-        self.device =  torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = xm.xla_device()
         self.tokenizer = AutoTokenizer.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="text_encoder")
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-        self.noise_scheduler.set_timesteps(1, device="cuda")
+        self.noise_scheduler.set_timesteps(1, device=self.device)
         self.vae = AutoencoderKL.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="vae")
         self.unet = UNet2DConditionModel.from_pretrained(self.args.pretrained_model_name_or_path, subfolder="unet")
 
-        self.weight_dtype = torch.float32
+        self.weight_dtype = torch.bfloat16
         if args.mixed_precision == "fp16":
-            self.weight_dtype = torch.float16
+            self.weight_dtype = torch.bfloat16
 
         osediff = torch.load(args.osediff_path)
         self.load_ckpt(osediff)
@@ -476,7 +478,7 @@ class OSEDiff_inference_time(torch.nn.Module):
         self.unet.to("cuda", dtype=self.weight_dtype)
         self.vae.to("cuda", dtype=self.weight_dtype)
         self.text_encoder.to("cuda", dtype=self.weight_dtype)
-        self.timesteps = torch.tensor([999], device="cuda").long() 
+        self.timesteps = torch.tensor([999], device=self.device).long() 
         self.noise_scheduler.alphas_cumprod = self.noise_scheduler.alphas_cumprod.cuda()
 
         
