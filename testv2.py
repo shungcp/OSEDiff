@@ -17,6 +17,9 @@ from ram import inference_ram as inference
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 
+import torch_xla.runtime as xr
+xr.initialize_cache('./cache/', readonly=False)
+
 tensor_transforms = transforms.Compose([
                 transforms.ToTensor(),
             ])
